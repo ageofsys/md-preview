@@ -1,0 +1,1336 @@
+#!/usr/bin/env zsh
+
+usage() {
+  cat <<'USAGE'
+Usage: md-preview [options] [mode]
+       md-preview [options] history [list]
+       md-preview [options] history <index>
+       md-preview [options] history show <index>
+
+Options:
+  --no-open          Write preview.md without opening the preview app
+  --open             Open the HTML preview (default)
+  --app NAME         App name for opening preview.html (default: system browser)
+  --dir DIR          Directory for preview.md (default: ~/.md-preview)
+  --config FILE      Config file (default: ~/.md-preview/config)
+  --output FILE      Write to a specific Markdown or HTML file
+  --keep-mermaid-html
+                     Keep HTML tags inside Mermaid blocks
+  -h, --help         Show this help
+
+Modes:
+  auto, md, markdown, raw, text, plain, code, mermaid, bash, sh, zsh,
+  json, jsonl, yaml, yml, toml, ini, csv, tsv, sql, diff, patch,
+  java, js, jsx, ts, tsx, python, py, go, rust, rs, c, cpp, swift,
+  kotlin, kt, dockerfile, html, xml, css, scss, log, url, links
+
+Config:
+  HISTORY_LIMIT=20   Number of recent inputs to keep
+  HISTORY_DIR=history
+                     Relative paths are resolved from --dir / MD_PREVIEW_DIR
+  PREVIEW_HTML=preview.html
+                     Browser viewer output file
+USAGE
+}
+
+trim_spaces() {
+  awk '{gsub(/^[ \t]+|[ \t]+$/, ""); print}'
+}
+
+expand_user_path() {
+  local path="$1"
+
+  case "$path" in
+    "~") print -r -- "$HOME" ;;
+    "~/"*) print -r -- "$HOME/${path#~/}" ;;
+    *) print -r -- "$path" ;;
+  esac
+}
+
+load_config() {
+  local config_file="$1"
+  local line
+  local key
+  local value
+
+  [[ -f "$config_file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    [[ "$line" == *"="* ]] || continue
+
+    key="$(printf '%s' "${line%%=*}" | trim_spaces)"
+    value="$(printf '%s' "${line#*=}" | trim_spaces)"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
+
+    case "$key" in
+      HISTORY_LIMIT|MD_PREVIEW_HISTORY_LIMIT)
+        history_limit="$value"
+        ;;
+      HISTORY_DIR|MD_PREVIEW_HISTORY_DIR)
+        history_dir="$value"
+        ;;
+      PREVIEW_HTML|MD_PREVIEW_HTML)
+        preview_html="$value"
+        ;;
+    esac
+  done < "$config_file"
+}
+
+normalize_history_settings() {
+  local preview_dir="$1"
+
+  if ! [[ "$history_limit" =~ '^[0-9]+$' ]]; then
+    history_limit=20
+  fi
+
+  if [[ -z "$history_dir" ]]; then
+    history_dir="$preview_dir/history"
+  else
+    history_dir="$(expand_user_path "$history_dir")"
+    case "$history_dir" in
+      /*) ;;
+      *) history_dir="$preview_dir/$history_dir" ;;
+    esac
+  fi
+}
+
+encode_base64() {
+  printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+encode_base64_file() {
+  base64 < "$1" | tr -d '\n'
+}
+
+first_nonempty_line() {
+  printf '%s\n' "$1" | awk 'NF {gsub(/^[ \t]+|[ \t]+$/, ""); print; exit}'
+}
+
+sample_nonempty_lines() {
+  printf '%s\n' "$1" | awk 'NF {print; count++} count >= 40 {exit}'
+}
+
+is_fenced_markdown() {
+  printf '%s\n' "$1" | grep -Eq '^[[:space:]]*(```|~~~)'
+}
+
+is_mermaid() {
+  printf '%s\n' "$1" | awk '
+    BEGIN { found = 0 }
+    /^[[:space:]]*$/ { next }
+    {
+      line = $0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line ~ /^%%\{init:/) {
+        next
+      }
+      if (line ~ /^(flowchart|graph|sequenceDiagram|classDiagram|classDiagram-v2|stateDiagram|stateDiagram-v2|erDiagram|gantt|pie|journey|gitGraph|mindmap|timeline|quadrantChart|requirementDiagram|C4Context|C4Container|C4Component|C4Dynamic|sankey-beta|xychart-beta|block-beta|packet-beta|kanban|architecture)([[:space:]]|$)/) {
+        found = 1
+        exit
+      }
+      exit
+    }
+    END { exit !found }
+  '
+}
+
+is_markdown_doc() {
+  local content="$1"
+
+  printf '%s\n' "$content" | grep -Eq '(^[[:space:]]{0,3}#{1,6}[[:space:]]+|^[[:space:]]{0,3}[-*+][[:space:]]+|^[[:space:]]{0,3}[-*+][[:space:]]+\[[ xX]\][[:space:]]+|^[[:space:]]{0,3}[0-9]+[.)][[:space:]]+|^[[:space:]]{0,3}>[[:space:]]+|^[[:space:]]{0,3}(```|~~~)|^[[:space:]]{0,3}(-{3,}|\*{3,}|_{3,})[[:space:]]*$|!\[[^]]*\]\([^)]+\)|\[[^]]+\]\([^)]+\))' && return 0
+
+  printf '%s\n' "$content" | grep -Eq '^[[:space:]]*\|?[[:space:]]*:?-{3,}:?[[:space:]]*(\|[[:space:]]*:?-{3,}:?[[:space:]]*)+\|?[[:space:]]*$'
+}
+
+is_diff() {
+  printf '%s\n' "$1" | grep -Eq '^(diff --git|Index: |---[[:space:]]+[ab]/|\+\+\+[[:space:]]+[ab]/|@@[[:space:]])'
+}
+
+is_json() {
+  local content="$1"
+  local first_line="$2"
+
+  printf '%s\n' "$first_line" | grep -Eq '^(\{|\[)' || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "$content" | python3 -m json.tool >/dev/null 2>&1
+  else
+    return 0
+  fi
+}
+
+is_jsonl() {
+  local content="$1"
+
+  command -v python3 >/dev/null 2>&1 || return 1
+  printf '%s\n' "$content" | python3 -c '
+import json
+import sys
+
+lines = [line for line in sys.stdin.read().splitlines() if line.strip()]
+if len(lines) < 2:
+    sys.exit(1)
+try:
+    for line in lines[:40]:
+        json.loads(line)
+except Exception:
+    sys.exit(1)
+sys.exit(0)
+' >/dev/null 2>&1
+}
+
+is_yaml() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*---[[:space:]]*$/ { docs++ }
+    /^[[:space:]]*-[[:space:]]+[A-Za-z0-9_.-]+:[[:space:]]*/ { list_maps++ }
+    /^[[:space:]]*[A-Za-z0-9_.-]+:[[:space:]]*/ { maps++ }
+    { rows++ }
+    rows >= 40 { exit }
+    END { exit !((docs >= 1 && (maps + list_maps) >= 1) || maps >= 2 || list_maps >= 1) }
+  '
+}
+
+is_toml() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*\[[A-Za-z0-9_.-]+\][[:space:]]*$/ { sections++ }
+    /^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=[[:space:]]*/ { pairs++ }
+    { rows++ }
+    rows >= 40 { exit }
+    END { exit !((sections >= 1 && pairs >= 1) || pairs >= 2) }
+  '
+}
+
+is_ini() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { sections++ }
+    /^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=[[:space:]]*/ { pairs++ }
+    { rows++ }
+    rows >= 40 { exit }
+    END { exit !(sections >= 1 && pairs >= 1) }
+  '
+}
+
+is_tsv_table() {
+  local tab=$'\t'
+
+  printf '%s\n' "$1" | awk -F "$tab" '
+    /^[[:space:]]*$/ { next }
+    {
+      rows++
+      if (NF < 2) bad = 1
+      if (cols == 0) cols = NF
+      else if (NF != cols) bad = 1
+    }
+    rows >= 40 { exit }
+    END { exit !(rows >= 2 && cols >= 2 && bad != 1) }
+  '
+}
+
+is_csv_table() {
+  printf '%s\n' "$1" | awk '
+    function csv_count(s,    i, ch, next_ch, cols, quoted) {
+      cols = 1
+      quoted = 0
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        next_ch = substr(s, i + 1, 1)
+        if (ch == "\"") {
+          if (quoted && next_ch == "\"") {
+            i++
+          } else {
+            quoted = !quoted
+          }
+        } else if (ch == "," && !quoted) {
+          cols++
+        }
+      }
+      return cols
+    }
+
+    /^[[:space:]]*$/ { next }
+    {
+      rows++
+      fields = csv_count($0)
+      if (fields < 2) bad = 1
+      if (cols == 0) cols = fields
+      else if (fields != cols) bad = 1
+    }
+    rows >= 40 { exit }
+    END { exit !(rows >= 2 && cols >= 2 && bad != 1) }
+  '
+}
+
+is_url_list() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*$/ { next }
+    {
+      rows++
+      line = $0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line !~ /^((https?|file):\/\/|mailto:|www\.)[^[:space:]<>]+$/) bad = 1
+    }
+    END { exit !(rows >= 1 && bad != 1) }
+  '
+}
+
+detect_auto() {
+  local content="$1"
+  local first_line="$2"
+  local first_lines="$3"
+
+  if is_fenced_markdown "$first_line"; then
+    print -r -- 'raw|markdown|markdown'
+  elif is_mermaid "$first_lines"; then
+    print -r -- 'code|mermaid|mermaid'
+  elif is_diff "$first_lines"; then
+    print -r -- 'code|diff|diff'
+  elif is_json "$content" "$first_line"; then
+    print -r -- 'code|json|json'
+  elif is_jsonl "$content"; then
+    print -r -- 'code|json|jsonl'
+  elif is_tsv_table "$content"; then
+    print -r -- 'table|tsv|tsv table'
+  elif is_csv_table "$content"; then
+    print -r -- 'table|csv|csv table'
+  elif is_url_list "$content"; then
+    print -r -- 'links|url|url list'
+  elif is_yaml "$first_lines"; then
+    print -r -- 'code|yaml|yaml'
+  elif is_toml "$first_lines"; then
+    print -r -- 'code|toml|toml'
+  elif is_ini "$first_lines"; then
+    print -r -- 'code|ini|ini'
+  elif is_markdown_doc "$content"; then
+    print -r -- 'raw|markdown|markdown'
+  elif printf '%s\n' "$first_lines" | grep -Eiq '^[[:space:]]*(SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|EXPLAIN|SHOW|DESCRIBE|TRUNCATE|MERGE|BEGIN|COMMIT|ROLLBACK)[[:space:]]'; then
+    print -r -- 'code|sql|sql'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(FROM|RUN|COPY|ADD|CMD|ENTRYPOINT|EXPOSE|ENV|ARG|WORKDIR|LABEL|VOLUME|USER|SHELL|HEALTHCHECK)[[:space:]]'; then
+    print -r -- 'code|dockerfile|dockerfile'
+  elif printf '%s\n' "$content" | grep -Eq '^#![[:space:]]*/(usr/)?bin/(env[[:space:]]+)?(bash|zsh|sh)' \
+    || printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(sudo|brew|docker|kubectl|helm|git|ssh|scp|rsync|curl|wget|cat|echo|printf|mkdir|touch|chmod|chown|find|grep|awk|sed|tail|less|cd|ls|npm|pnpm|yarn|node|python3?|java|mvn|gradle|ps|netstat|lsof|systemctl|journalctl|tmux|caffeinate|open|pbpaste|pbcopy|export|source|alias)[[:space:]]' \
+    || printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*\(\)[[:space:]]*\{'; then
+    print -r -- 'code|bash|shell'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(@[A-Za-z_][A-Za-z0-9_.]*(\(.*\))?|((async[[:space:]]+)?def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\()|class[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[(::]|import[[:space:]]+[A-Za-z_][A-Za-z0-9_.,[:space:]]*$|from[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*[[:space:]]+import[[:space:]])'; then
+    print -r -- 'code|python|python'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(package[[:space:]]|import[[:space:]]+java\.|public[[:space:]]+class|class[[:space:]]+[A-Z]|record[[:space:]]+[A-Z]|interface[[:space:]]+[A-Z]|enum[[:space:]]+[A-Z]|@SpringBootApplication|@RestController|@Service|@Component)'; then
+    print -r -- 'code|java|java'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(const|let|var|function|async[[:space:]]+function|import[[:space:]].*from|import[[:space:]]+[^[:space:]]+|export[[:space:]]|type[[:space:]]+[A-Z]|interface[[:space:]]+[A-Z]|console\.)'; then
+    print -r -- 'code|typescript|typescript'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(package[[:space:]]+main|func[[:space:]]+[A-Za-z_]|import[[:space:]]*\()'; then
+    print -r -- 'code|go|go'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(fn|let|use|mod|pub|impl|struct|enum|trait)[[:space:]]'; then
+    print -r -- 'code|rust|rust'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(#include[[:space:]]*<|int[[:space:]]+main[[:space:]]*\(|void[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(|class[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{)'; then
+    print -r -- 'code|cpp|c/c++'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(import[[:space:]]+Swift|struct[[:space:]]+[A-Z]|class[[:space:]]+[A-Z]|func[[:space:]]+[A-Za-z_]|let[[:space:]]+[A-Za-z_]|var[[:space:]]+[A-Za-z_])'; then
+    print -r -- 'code|swift|swift'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*(package[[:space:]]+[A-Za-z0-9_.]+|import[[:space:]]+[A-Za-z0-9_.]+|fun[[:space:]]+[A-Za-z_]|data[[:space:]]+class[[:space:]]+[A-Z]|class[[:space:]]+[A-Z])'; then
+    print -r -- 'code|kotlin|kotlin'
+  elif printf '%s\n' "$first_line" | grep -Eq '^<\?xml'; then
+    print -r -- 'code|xml|xml'
+  elif printf '%s\n' "$first_line" | grep -Eq '^<(!DOCTYPE html|html|head|body|div|span|script|style|template|[A-Za-z_][A-Za-z0-9_.:-]*)'; then
+    print -r -- 'code|html|html/xml'
+  elif printf '%s\n' "$first_lines" | grep -Eq '^[[:space:]]*([.#]?[A-Za-z][A-Za-z0-9_-]*|:[A-Za-z-]+|@[a-z-]+)[^{]*\{|^[[:space:]]*[A-Za-z-]+:[[:space:]]*[^;]+;[[:space:]]*$'; then
+    print -r -- 'code|css|css'
+  elif printf '%s\n' "$content" | grep -Eq '(^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:|^\[[0-9]{4}-[0-9]{2}-[0-9]{2}|[[:space:]](ERROR|WARN|INFO|DEBUG|TRACE)[[:space:]]|Exception|Traceback|^[[:space:]]+at[[:space:]][A-Za-z0-9_.]+\()'; then
+    print -r -- 'code|text|log'
+  else
+    print -r -- 'prose|text|plain text'
+  fi
+}
+
+resolve_mode() {
+  local mode="$1"
+  local first_line="$2"
+
+  case "$mode" in
+    auto)
+      return 2
+      ;;
+    md|markdown|raw)
+      print -r -- 'raw|markdown|markdown'
+      ;;
+    text|txt|plain|prose)
+      print -r -- 'prose|text|plain text'
+      ;;
+    code|pre)
+      print -r -- 'code|text|plain code'
+      ;;
+    mermaid|mmd)
+      if is_fenced_markdown "$first_line"; then
+        print -r -- 'raw|markdown|markdown'
+      else
+        print -r -- 'code|mermaid|mermaid'
+      fi
+      ;;
+    bash|sh|shell|zsh)
+      print -r -- 'code|bash|shell'
+      ;;
+    json)
+      print -r -- 'code|json|json'
+      ;;
+    jsonl)
+      print -r -- 'code|json|jsonl'
+      ;;
+    yaml|yml)
+      print -r -- 'code|yaml|yaml'
+      ;;
+    toml)
+      print -r -- 'code|toml|toml'
+      ;;
+    ini)
+      print -r -- 'code|ini|ini'
+      ;;
+    csv)
+      print -r -- 'table|csv|csv table'
+      ;;
+    tsv)
+      print -r -- 'table|tsv|tsv table'
+      ;;
+    url|urls|link|links)
+      print -r -- 'links|url|url list'
+      ;;
+    sql|diff|java|go|rust|swift|dockerfile|html|xml|css|scss)
+      print -r -- "code|$mode|$mode"
+      ;;
+    patch)
+      print -r -- 'code|diff|diff'
+      ;;
+    js|javascript)
+      print -r -- 'code|javascript|javascript'
+      ;;
+    jsx)
+      print -r -- 'code|jsx|jsx'
+      ;;
+    ts|typescript)
+      print -r -- 'code|typescript|typescript'
+      ;;
+    tsx)
+      print -r -- 'code|tsx|tsx'
+      ;;
+    py|python)
+      print -r -- 'code|python|python'
+      ;;
+    rs)
+      print -r -- 'code|rust|rust'
+      ;;
+    c)
+      print -r -- 'code|c|c'
+      ;;
+    cpp|cc|cxx)
+      print -r -- 'code|cpp|c++'
+      ;;
+    kt|kotlin)
+      print -r -- 'code|kotlin|kotlin'
+      ;;
+    log)
+      print -r -- 'code|text|log'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+write_code_block() {
+  local content="$1"
+  local lang="$2"
+  local preview_file="$3"
+  local max_ticks
+  local fence
+
+  max_ticks="$(printf '%s' "$content" | awk '
+    {
+      line = $0
+      while (match(line, /`+/)) {
+        if (RLENGTH > max) max = RLENGTH
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+    END { print max + 1 }
+  ')"
+
+  if [[ -z "$max_ticks" || "$max_ticks" -lt 3 ]]; then
+    max_ticks=3
+  fi
+
+  fence="$(printf '%*s' "$max_ticks" '' | tr ' ' '`')"
+  printf '%s%s\n%s\n%s\n' "$fence" "$lang" "$content" "$fence" > "$preview_file"
+}
+
+normalize_mermaid_text() {
+  perl -pe '
+    s/&lt;br\s*\/?&gt;|<br\s*\/?>/ \/ /gi;
+    s/[ \t]+$//;
+  '
+}
+
+write_raw_markdown() {
+  local content="$1"
+  local preview_file="$2"
+  local mermaid_compat="$3"
+
+  if [[ "$mermaid_compat" == "0" ]]; then
+    printf '%s\n' "$content" > "$preview_file"
+    return
+  fi
+
+  printf '%s\n' "$content" | perl -Mstrict -Mwarnings -e '
+    my $in_mermaid = 0;
+    my $fence_char = "";
+    my $fence_len = 0;
+
+    while (my $line = <STDIN>) {
+      if (!$in_mermaid && $line =~ /^([ \t]*)(`{3,}|~{3,})[ \t]*(?:mermaid|mmd)\b.*$/i) {
+        $in_mermaid = 1;
+        $fence_char = substr($2, 0, 1);
+        $fence_len = length($2);
+        print "$1$2mermaid\n";
+        next;
+      }
+
+      if ($in_mermaid) {
+        my $close_re = qr/^[ \t]*(?:\Q$fence_char\E){$fence_len,}[ \t]*$/;
+        if ($line =~ $close_re) {
+          $in_mermaid = 0;
+          print $line;
+          next;
+        }
+
+        # Some Markdown previewers pass escaped HTML to Mermaid. Avoid parser
+        # failures by keeping labels textual instead of relying on HTML breaks.
+        $line =~ s/&lt;br\s*\/?&gt;|<br\s*\/?>/ \/ /gi;
+        $line =~ s/[ \t]+$//;
+      }
+
+      print $line;
+    }
+  ' > "$preview_file"
+}
+
+write_prose() {
+  printf '%s\n' "$1" | perl -pe 's/[ \t]+$//; s/&/&amp;/g; s/</&lt;/g; s/>/&gt;/g; s/$/  / if /\S/' > "$2"
+}
+
+write_links() {
+  printf '# Links\n\n' > "$2"
+  printf '%s\n' "$1" | awk '
+    NF {
+      line = $0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line ~ /^www\./) {
+        print "- <https://" line ">"
+      } else {
+        print "- <" line ">"
+      }
+    }
+  ' >> "$2"
+}
+
+write_tsv_table() {
+  local tab=$'\t'
+
+  printf '%s\n' "$1" | awk -F "$tab" '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      gsub(/\|/, "\\|", s)
+      return s == "" ? " " : s
+    }
+    /^[[:space:]]*$/ { next }
+    rows == 0 {
+      cols = NF
+      printf "|"
+      for (i = 1; i <= cols; i++) printf " %s |", trim($i)
+      printf "\n|"
+      for (i = 1; i <= cols; i++) printf " --- |"
+      printf "\n"
+      rows++
+      next
+    }
+    {
+      printf "|"
+      for (i = 1; i <= cols; i++) printf " %s |", trim($i)
+      printf "\n"
+      rows++
+    }
+  ' > "$2"
+}
+
+write_csv_table() {
+  printf '%s\n' "$1" | awk '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      gsub(/\|/, "\\|", s)
+      return s == "" ? " " : s
+    }
+    function csv_split(s, out,    i, ch, next_ch, n, field, quoted) {
+      delete out
+      n = 1
+      field = ""
+      quoted = 0
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        next_ch = substr(s, i + 1, 1)
+        if (ch == "\"") {
+          if (quoted && next_ch == "\"") {
+            field = field "\""
+            i++
+          } else {
+            quoted = !quoted
+          }
+        } else if (ch == "," && !quoted) {
+          out[n++] = field
+          field = ""
+        } else {
+          field = field ch
+        }
+      }
+      out[n] = field
+      return n
+    }
+    /^[[:space:]]*$/ { next }
+    rows == 0 {
+      cols = csv_split($0, fields)
+      printf "|"
+      for (i = 1; i <= cols; i++) printf " %s |", trim(fields[i])
+      printf "\n|"
+      for (i = 1; i <= cols; i++) printf " --- |"
+      printf "\n"
+      rows++
+      next
+    }
+    {
+      csv_split($0, fields)
+      printf "|"
+      for (i = 1; i <= cols; i++) printf " %s |", trim(fields[i])
+      printf "\n"
+      rows++
+    }
+  ' > "$2"
+}
+
+write_preview() {
+  local render="$1"
+  local lang="$2"
+  local content="$3"
+  local preview_file="$4"
+  local mermaid_compat="${5:-1}"
+
+  case "$render" in
+    raw)
+      write_raw_markdown "$content" "$preview_file" "$mermaid_compat"
+      ;;
+    code)
+      if [[ "$lang" == "mermaid" && "$mermaid_compat" != "0" ]]; then
+        content="$(printf '%s\n' "$content" | normalize_mermaid_text)"
+      fi
+      write_code_block "$content" "$lang" "$preview_file"
+      ;;
+    prose)
+      write_prose "$content" "$preview_file"
+      ;;
+    links)
+      write_links "$content" "$preview_file"
+      ;;
+    table)
+      case "$lang" in
+        tsv) write_tsv_table "$content" "$preview_file" ;;
+        *) write_csv_table "$content" "$preview_file" ;;
+      esac
+      ;;
+    *)
+      write_code_block "$content" text "$preview_file"
+      ;;
+  esac
+}
+
+history_file_at() {
+  local history_dir="$1"
+  local index="$2"
+  local files=("${history_dir}"/*(.N.om))
+
+  if ! [[ "$index" =~ '^[0-9]+$' ]] || (( index < 1 || index > ${#files[@]} )); then
+    return 1
+  fi
+
+  print -r -- "$files[$index]"
+}
+
+history_summary() {
+  local file="$1"
+
+  awk '
+    NF {
+      line = $0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      gsub(/[ \t]+/, " ", line)
+      if (length(line) > 100) {
+        line = substr(line, 1, 97) "..."
+      }
+      print line
+      found = 1
+      exit
+    }
+    END {
+      if (!found) print "(empty)"
+    }
+  ' "$file"
+}
+
+list_history() {
+  local history_dir="$1"
+  local files=("${history_dir}"/*(.N.om))
+  local i=1
+  local file
+  local modified
+  local summary
+
+  if (( ${#files[@]} == 0 )); then
+    print -r -- "이력이 없습니다."
+    return 0
+  fi
+
+  for file in "${files[@]}"; do
+    modified="$(date -r "$file" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || print -r -- '-')"
+    summary="$(history_summary "$file")"
+    printf '%2d  %s  %s\n' "$i" "$modified" "$summary"
+    (( i++ ))
+  done
+}
+
+trim_history() {
+  local history_dir="$1"
+  local limit="$2"
+  local files=("${history_dir}"/*(.N.om))
+  local i
+
+  (( limit >= 0 )) || limit=20
+
+  for (( i = limit + 1; i <= ${#files[@]}; i++ )); do
+    rm -f -- "$files[$i]"
+  done
+}
+
+save_history() {
+  local content="$1"
+  local history_dir="$2"
+  local limit="$3"
+  local history_file
+
+  [[ -n "${content//[[:space:]]/}" ]] || return 0
+  (( limit > 0 )) || return 0
+
+  mkdir -p "$history_dir"
+  history_file="$history_dir/$(date '+%Y%m%d-%H%M%S')-$$-$RANDOM.md"
+  printf '%s\n' "$content" > "$history_file"
+  trim_history "$history_dir" "$limit"
+}
+
+read_clipboard() {
+  if ! command -v pbpaste >/dev/null 2>&1; then
+    return 1
+  fi
+
+  pbpaste
+}
+
+file_url_with_cache_buster() {
+  local path="$1"
+  local stamp="${EPOCHSECONDS:-0}-$RANDOM"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import pathlib, sys, urllib.parse; print(pathlib.Path(sys.argv[1]).resolve().as_uri() + "?v=" + urllib.parse.quote(sys.argv[2]))' "$path" "$stamp"
+  else
+    print -r -- "file://$path?v=$stamp"
+  fi
+}
+
+write_html_preview() {
+  local html_file="$1"
+  local markdown_file="$2"
+  local source_content="$3"
+  local label="$4"
+  local render="$5"
+
+  cat > "$html_file" <<HTML
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>md-preview</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github.min.css">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f1e8;
+      --panel: #fffdf8;
+      --ink: #20201d;
+      --muted: #6f675d;
+      --line: #ddd3c6;
+      --accent: #a65a27;
+      --accent-soft: #f1decd;
+      --code: #f5ecdf;
+      --shadow: 0 12px 32px rgba(46, 34, 20, 0.12);
+      --font-body: "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+      --font-code: "JetBrains Mono", "D2Coding", "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+    }
+
+    html {
+      min-height: 100%;
+      background: var(--bg);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(196, 117, 52, 0.16), transparent 26rem),
+        radial-gradient(circle at 88% 0%, rgba(130, 150, 170, 0.14), transparent 30rem),
+        linear-gradient(135deg, #faf6ee 0%, #efe6d9 52%, #f8f3ea 100%);
+      color: var(--ink);
+      font-family: var(--font-body);
+      font-size: 17px;
+      font-weight: 450;
+      letter-spacing: -0.01em;
+      word-break: keep-all;
+    }
+
+    main {
+      width: min(1480px, calc(100% - 48px));
+      min-width: 0;
+      margin: 0 auto;
+      padding: 8px 0 16px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 6px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .actions button {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 11px;
+      background: var(--panel);
+      color: var(--ink);
+      cursor: pointer;
+    }
+
+    .actions button.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fffaf2;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255, 253, 248, 0.94);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .content {
+      padding: clamp(24px, 3vw, 42px);
+      overflow: auto;
+    }
+
+    .source {
+      display: none;
+      margin: 0;
+      padding: clamp(24px, 3vw, 42px);
+      overflow: auto;
+      background: #241f1a;
+      color: #f8efe2;
+      font: 0.9rem/1.65 var(--font-code);
+      white-space: pre-wrap;
+    }
+
+    .show-source .content { display: none; }
+    .show-source .source { display: block; }
+
+    .content :first-child { margin-top: 0; }
+    .content h1, .content h2, .content h3 {
+      letter-spacing: -0.025em;
+      line-height: 1.08;
+      font-weight: 800;
+    }
+    .content h1 { font-size: 2.2rem; }
+    .content h2 { margin-top: 2rem; font-size: 1.65rem; }
+    .content h3 { margin-top: 1.6rem; font-size: 1.25rem; }
+    .content p, .content li { line-height: 1.72; }
+    .content a { color: var(--accent); }
+    .content blockquote {
+      margin-left: 0;
+      padding: 0.3rem 1rem;
+      border-left: 4px solid var(--accent);
+      color: #50463d;
+      background: #f7efe3;
+    }
+    .content pre {
+      overflow: auto;
+      border-radius: 14px;
+      padding: 1rem 1.2rem;
+      background: var(--code);
+      border: 1px solid var(--line);
+    }
+    .content pre code.hljs {
+      padding: 0;
+      background: transparent;
+    }
+    .content code {
+      font-family: var(--font-code);
+      font-size: 0.9em;
+      letter-spacing: 0;
+    }
+    .content :not(pre) > code {
+      padding: 0.1rem 0.32rem;
+      border-radius: 0.38rem;
+      background: var(--code);
+    }
+    .content table {
+      display: block;
+      width: 100%;
+      overflow: auto;
+      border-collapse: collapse;
+    }
+    .content th, .content td {
+      border: 1px solid var(--line);
+      padding: 0.55rem 0.7rem;
+    }
+    .content th { background: #f0e2d2; }
+    ::selection {
+      background: rgba(255, 213, 92, 0.5);
+      color: inherit;
+    }
+    ::highlight(md-preview-highlight) {
+      background: rgba(255, 211, 77, 0.55);
+      color: inherit;
+    }
+    .temp-highlight {
+      background: rgba(255, 211, 77, 0.55);
+      border-radius: 0.18em;
+      box-decoration-break: clone;
+      -webkit-box-decoration-break: clone;
+    }
+    .mermaid {
+      display: flex;
+      justify-content: center;
+      overflow: auto;
+      padding: 1rem;
+      border-radius: 18px;
+      background: #fffaf2;
+      border: 1px solid var(--line);
+    }
+
+    @media (max-width: 860px) {
+      main {
+        width: calc(100% - 24px);
+        padding: 8px 0 16px;
+      }
+      .card { border-radius: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="topbar">
+      <div class="actions">
+        <button id="renderedBtn" class="active" type="button">Rendered</button>
+        <button id="sourceBtn" type="button">Source</button>
+      </div>
+    </div>
+    <section id="viewerCard" class="card">
+      <article id="content" class="content"></article>
+      <pre id="source" class="source"></pre>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/lib/common.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+  <script>
+    const decodeB64 = (value) => {
+      const bytes = Uint8Array.from(atob(value || ""), (char) => char.charCodeAt(0));
+      return new TextDecoder("utf-8").decode(bytes);
+    };
+
+    const sourceB64 = "$(encode_base64 "$source_content")";
+    const markdownB64 = "$(encode_base64_file "$markdown_file")";
+
+    marked.setOptions({
+      gfm: true,
+      breaks: false,
+      mangle: false,
+      headerIds: false
+    });
+
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "loose",
+      theme: "default"
+    });
+
+    const content = document.getElementById("content");
+    const source = document.getElementById("source");
+    const card = document.getElementById("viewerCard");
+    const renderedBtn = document.getElementById("renderedBtn");
+    const sourceBtn = document.getElementById("sourceBtn");
+    const highlightRanges = [];
+
+    function forceRepaint() {
+      document.body.style.transform = "translateZ(0)";
+      document.body.style.outline = "1px solid transparent";
+      void document.body.offsetHeight;
+      window.dispatchEvent(new Event("resize"));
+      requestAnimationFrame(() => {
+        document.body.style.transform = "";
+        document.body.style.outline = "";
+      });
+    }
+
+    function scheduleInitialRepaints() {
+      [0, 50, 150, 350, 800, 1500].forEach((delay) => {
+        window.setTimeout(forceRepaint, delay);
+      });
+    }
+
+    function isInsideViewer(node) {
+      return node && (content.contains(node) || source.contains(node));
+    }
+
+    function refreshSelectionHighlights() {
+      if (!("CSS" in window) || !CSS.highlights || !("Highlight" in window)) {
+        return false;
+      }
+      CSS.highlights.set("md-preview-highlight", new Highlight(...highlightRanges));
+      return true;
+    }
+
+    function fallbackWrapHighlight(range) {
+      const mark = document.createElement("mark");
+      mark.className = "temp-highlight";
+      try {
+        mark.append(range.extractContents());
+        range.insertNode(mark);
+      } catch (error) {
+        console.warn("Selection highlight fallback failed", error);
+      }
+    }
+
+    function highlightCurrentSelection() {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.toString().trim()) {
+        return;
+      }
+
+      const range = selection.getRangeAt(0);
+      if (!isInsideViewer(range.commonAncestorContainer)) {
+        return;
+      }
+
+      const clonedRange = range.cloneRange();
+      highlightRanges.push(clonedRange);
+      if (!refreshSelectionHighlights()) {
+        fallbackWrapHighlight(range);
+      }
+      selection.removeAllRanges();
+    }
+
+    async function renderPreview() {
+      const markdown = decodeB64(markdownB64);
+      const rawSource = decodeB64(sourceB64);
+      source.textContent = rawSource;
+
+      const dirty = marked.parse(markdown);
+      content.innerHTML = DOMPurify.sanitize(dirty, {
+        ADD_TAGS: ["iframe"],
+        ADD_ATTR: ["target", "rel"]
+      });
+
+      content.querySelectorAll("a[href]").forEach((anchor) => {
+        anchor.target = "_blank";
+        anchor.rel = "noopener noreferrer";
+      });
+
+      content.querySelectorAll("pre code").forEach((code) => {
+        const language = [...code.classList].find((className) => className.startsWith("language-"))?.replace("language-", "");
+        if (language === "mermaid" || language === "mmd") {
+          const mermaidNode = document.createElement("div");
+          mermaidNode.className = "mermaid";
+          mermaidNode.textContent = code.textContent;
+          code.closest("pre").replaceWith(mermaidNode);
+        } else {
+          hljs.highlightElement(code);
+        }
+      });
+
+      try {
+        await mermaid.run({ nodes: content.querySelectorAll(".mermaid") });
+      } catch (error) {
+        console.error(error);
+      }
+
+      scheduleInitialRepaints();
+    }
+
+    function setSourceMode(enabled) {
+      card.classList.toggle("show-source", enabled);
+      renderedBtn.classList.toggle("active", !enabled);
+      sourceBtn.classList.toggle("active", enabled);
+    }
+
+    renderedBtn.addEventListener("click", () => setSourceMode(false));
+    sourceBtn.addEventListener("click", () => setSourceMode(true));
+    card.addEventListener("mouseup", () => window.setTimeout(highlightCurrentSelection, 0));
+    window.addEventListener("load", scheduleInitialRepaints);
+    window.addEventListener("pageshow", scheduleInitialRepaints);
+
+    renderPreview();
+  </script>
+</body>
+</html>
+HTML
+}
+
+open_preview() {
+  local app="$1"
+  local preview_file="$2"
+  local target="$preview_file"
+
+  if [[ -z "$app" && "$preview_file" == *.html ]]; then
+    target="$(file_url_with_cache_buster "$preview_file")"
+  fi
+
+  if [[ -n "$app" ]] && open -a "$app" "$preview_file" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  open "$target" >/dev/null 2>&1 || open "$preview_file" >/dev/null 2>&1
+}
+
+main() {
+  emulate -L zsh
+  setopt local_options no_nomatch
+
+  local preview_dir="${MD_PREVIEW_DIR:-$HOME/.md-preview}"
+  local output_file="${MD_PREVIEW_FILE:-}"
+  local config_file="${MD_PREVIEW_CONFIG:-}"
+  local app="${MD_PREVIEW_APP:-}"
+  local should_open="${MD_PREVIEW_OPEN:-1}"
+  local mermaid_compat="${MD_PREVIEW_MERMAID_COMPAT:-1}"
+  local history_limit=20
+  local history_dir=""
+  local preview_html="${MD_PREVIEW_HTML:-}"
+  local command=""
+  local history_action=""
+  local history_index=""
+  local mode="auto"
+  local content
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --no-open)
+        should_open=0
+        ;;
+      --open)
+        should_open=1
+        ;;
+      --app)
+        shift
+        [[ $# -gt 0 ]] || { print -u2 -- "--app requires a value"; return 1; }
+        app="$1"
+        ;;
+      --dir)
+        shift
+        [[ $# -gt 0 ]] || { print -u2 -- "--dir requires a value"; return 1; }
+        preview_dir="$1"
+        ;;
+      --config)
+        shift
+        [[ $# -gt 0 ]] || { print -u2 -- "--config requires a value"; return 1; }
+        config_file="$1"
+        ;;
+      --output)
+        shift
+        [[ $# -gt 0 ]] || { print -u2 -- "--output requires a value"; return 1; }
+        output_file="$1"
+        ;;
+      --keep-mermaid-html)
+        mermaid_compat=0
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        print -u2 -- "Unknown option: $1"
+        usage
+        return 1
+        ;;
+      history|hist)
+        command="history"
+        shift
+        history_action="${1:-list}"
+        if [[ "$history_action" =~ '^[0-9]+$' ]]; then
+          history_index="$history_action"
+          history_action="preview"
+        elif [[ "$history_action" == "show" || "$history_action" == "preview" ]]; then
+          shift
+          history_index="${1:-}"
+        elif [[ "$history_action" == "list" || -z "$history_action" ]]; then
+          history_action="list"
+        else
+          print -u2 -- "Unknown history action: $history_action"
+          usage
+          return 1
+        fi
+        break
+        ;;
+      *)
+        mode="$1"
+        ;;
+    esac
+    shift
+  done
+
+  preview_dir="$(expand_user_path "$preview_dir")"
+  [[ -n "$output_file" ]] && output_file="$(expand_user_path "$output_file")"
+
+  config_file="${config_file:-$preview_dir/config}"
+  config_file="$(expand_user_path "$config_file")"
+  load_config "$config_file"
+  [[ -n "${MD_PREVIEW_HISTORY_LIMIT:-}" ]] && history_limit="$MD_PREVIEW_HISTORY_LIMIT"
+  [[ -n "${MD_PREVIEW_HISTORY_DIR:-}" ]] && history_dir="$MD_PREVIEW_HISTORY_DIR"
+  [[ -n "${MD_PREVIEW_HTML:-}" ]] && preview_html="$MD_PREVIEW_HTML"
+  normalize_history_settings "$preview_dir"
+
+  local markdown_file
+  local html_file
+  if [[ -n "$output_file" && "$output_file" == *.html ]]; then
+    html_file="$output_file"
+    markdown_file="${output_file:r}.md"
+  elif [[ -n "$output_file" ]]; then
+    markdown_file="$output_file"
+    html_file="${output_file:r}.html"
+  else
+    markdown_file="$preview_dir/preview.md"
+    preview_html="${preview_html:-preview.html}"
+    preview_html="$(expand_user_path "$preview_html")"
+    case "$preview_html" in
+      /*) html_file="$preview_html" ;;
+      *) html_file="$preview_dir/$preview_html" ;;
+    esac
+  fi
+  mkdir -p "${markdown_file:h}" "${html_file:h}"
+
+  if [[ "$command" == "history" ]]; then
+    case "$history_action" in
+      list)
+        list_history "$history_dir"
+        return 0
+        ;;
+      show)
+        [[ -n "$history_index" ]] || { print -u2 -- "history show requires an index"; return 1; }
+        local history_file
+        history_file="$(history_file_at "$history_dir" "$history_index")" || {
+          print -u2 -- "이력 번호가 유효하지 않습니다: $history_index"
+          return 1
+        }
+        sed -n '1,$p' "$history_file"
+        return 0
+        ;;
+      preview)
+        [[ -n "$history_index" ]] || { print -u2 -- "history preview requires an index"; return 1; }
+        local history_file
+        history_file="$(history_file_at "$history_dir" "$history_index")" || {
+          print -u2 -- "이력 번호가 유효하지 않습니다: $history_index"
+          return 1
+        }
+        content="$(cat "$history_file")"
+        ;;
+    esac
+  fi
+
+  if [[ "$command" != "history" ]]; then
+    if [[ -t 0 ]]; then
+      if ! content="$(read_clipboard)"; then
+        print -u2 -- "pbpaste를 찾을 수 없습니다. 파이프 입력을 사용하세요."
+        return 1
+      fi
+    else
+      content="$(cat)"
+      if [[ -z "${content//[[:space:]]/}" ]]; then
+        content="$(read_clipboard 2>/dev/null || true)"
+      fi
+    fi
+  fi
+
+  content="$(printf '%s' "$content" | perl -pe 's/\r\n?/\n/g; s/\0//g')"
+
+  if [[ -z "${content//[[:space:]]/}" ]]; then
+    print -u2 -- "입력 내용이 비어 있습니다. 클립보드 또는 파이프 입력을 확인하세요."
+    return 1
+  fi
+
+  local first_line
+  local first_lines
+  first_line="$(first_nonempty_line "$content")"
+  first_lines="$(sample_nonempty_lines "$content")"
+
+  local resolved
+  if [[ "$mode" == "auto" ]]; then
+    resolved="$(detect_auto "$content" "$first_line" "$first_lines")"
+  else
+    resolved="$(resolve_mode "$mode" "$first_line")" || {
+      usage
+      return 1
+    }
+  fi
+
+  local render="${resolved%%|*}"
+  local rest="${resolved#*|}"
+  local lang="${rest%%|*}"
+  local label="${rest#*|}"
+
+  write_preview "$render" "$lang" "$content" "$markdown_file" "$mermaid_compat"
+
+  if [[ "$command" != "history" ]]; then
+    save_history "$content" "$history_dir" "$history_limit"
+  fi
+
+  write_html_preview "$html_file" "$markdown_file" "$content" "$label" "$render"
+
+  if [[ "$should_open" != "0" ]]; then
+    if ! open_preview "$app" "$html_file"; then
+      print -u2 -- "미리보기 앱을 열 수 없습니다: $app"
+    fi
+  fi
+
+  print -r -- "Preview: $html_file"
+  print -r -- "Markdown: $markdown_file"
+  print -r -- "Detected format: $label"
+  print -r -- "Render mode: $render"
+}
+
+main "$@"
