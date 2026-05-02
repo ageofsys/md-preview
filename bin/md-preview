@@ -1011,6 +1011,12 @@ write_html_preview() {
       });
     }
 
+    function escapeMarkdownHtmlHazards(markdown) {
+      return markdown.replace(/<\/?(script|style|textarea|title|xmp|iframe|object|embed|link|meta|base)(?=[\s>/])/gi, (tag) => {
+        return tag.replace("<", "&lt;");
+      });
+    }
+
     function isInsideViewer(node) {
       return node && (content.contains(node) || source.contains(node));
     }
@@ -1058,7 +1064,7 @@ write_html_preview() {
       const rawSource = decodeB64(sourceB64);
       source.textContent = rawSource;
 
-      const dirty = marked.parse(markdown);
+      const dirty = marked.parse(escapeMarkdownHtmlHazards(markdown));
       content.innerHTML = DOMPurify.sanitize(dirty, {
         ADD_TAGS: ["iframe"],
         ADD_ATTR: ["target", "rel"]
