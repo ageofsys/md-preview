@@ -37,6 +37,19 @@ mdp
 cat response.md | mdp
 ```
 
+특정 파일을 직접 지정해 렌더링할 수도 있습니다. 인자가 실제 존재하는 파일 경로이면 자동으로 파일 입력으로 처리합니다.
+
+```sh
+mdp docs/retrospective/2026-05-05-ai-agent-workflow-retrospective.md
+```
+
+명시적으로 지정하려면 `--file` 옵션을 사용합니다. mode 키워드와 동명의 파일이 현재 디렉터리에 있는 경우 등에 유용합니다.
+
+```sh
+mdp --file docs/notes.md
+mdp markdown docs/notes.md   # mode + 파일 동시 지정
+```
+
 브라우저를 열지 않고 파일만 생성할 수도 있습니다.
 
 ```sh

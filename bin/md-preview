@@ -2,7 +2,7 @@
 
 usage() {
   cat <<'USAGE'
-Usage: md-preview [options] [mode]
+Usage: md-preview [options] [mode] [file]
        md-preview [options] history [list]
        md-preview [options] history <index>
        md-preview [options] history show <index>
@@ -14,9 +14,15 @@ Options:
   --dir DIR          Directory for preview.md (default: ~/.md-preview)
   --config FILE      Config file (default: ~/.md-preview/config)
   --output FILE      Write to a specific Markdown or HTML file
+  --file FILE        Read input from FILE instead of clipboard/stdin
   --keep-mermaid-html
                      Keep HTML tags inside Mermaid blocks
   -h, --help         Show this help
+
+Input sources (in priority order):
+  1. --file FILE or a positional file path that exists on disk
+  2. stdin (when piped)
+  3. clipboard via pbpaste
 
 Modes:
   auto, md, markdown, raw, text, plain, code, mermaid, bash, sh, zsh,
@@ -144,6 +150,23 @@ is_markdown_doc() {
   printf '%s\n' "$content" | grep -Eq '(^[[:space:]]{0,3}#{1,6}[[:space:]]+|^[[:space:]]{0,3}[-*+][[:space:]]+|^[[:space:]]{0,3}[-*+][[:space:]]+\[[ xX]\][[:space:]]+|^[[:space:]]{0,3}[0-9]+[.)][[:space:]]+|^[[:space:]]{0,3}>[[:space:]]+|^[[:space:]]{0,3}(```|~~~)|^[[:space:]]{0,3}(-{3,}|\*{3,}|_{3,})[[:space:]]*$|!\[[^]]*\]\([^)]+\)|\[[^]]+\]\([^)]+\))' && return 0
 
   printf '%s\n' "$content" | grep -Eq '^[[:space:]]*\|?[[:space:]]*:?-{3,}:?[[:space:]]*(\|[[:space:]]*:?-{3,}:?[[:space:]]*)+\|?[[:space:]]*$'
+}
+
+has_terminal_box_table() {
+  printf '%s\n' "$1" | perl -Mstrict -Mwarnings -CSDA -ne '
+    our $rows = 0;
+    $rows++ if /[\x{2502}\x{250C}\x{2510}\x{2514}\x{2518}\x{251C}\x{2524}\x{252C}\x{2534}\x{253C}]/;
+    END { exit !($rows >= 2) }
+  '
+}
+
+has_cli_finding_blocks() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*Finding:[[:space:]]*/ { findings++ }
+    /^[[:space:]]*정정 위치:[[:space:]]*/ { locations++ }
+    /^[[:space:]]*핵심 변경:[[:space:]]*/ { changes++ }
+    END { exit !(findings >= 1 && (locations >= 1 || changes >= 1)) }
+  '
 }
 
 is_diff() {
@@ -301,6 +324,18 @@ detect_auto() {
     print -r -- 'table|csv|csv table'
   elif is_url_list "$content"; then
     print -r -- 'links|url|url list'
+  elif has_terminal_box_table "$content"; then
+    if is_markdown_doc "$content"; then
+      print -r -- 'raw|markdown|markdown + terminal table'
+    else
+      print -r -- 'prose|text|plain text + terminal table'
+    fi
+  elif has_cli_finding_blocks "$content"; then
+    if is_markdown_doc "$content"; then
+      print -r -- 'raw|markdown|markdown + cli findings'
+    else
+      print -r -- 'prose|text|plain text + cli findings'
+    fi
   elif is_yaml "$first_lines"; then
     print -r -- 'code|yaml|yaml'
   elif is_toml "$first_lines"; then
@@ -472,13 +507,228 @@ normalize_mermaid_text() {
   '
 }
 
+transform_terminal_box_tables() {
+  perl -Mstrict -Mwarnings -CSDA -e '
+    my @lines = <STDIN>;
+    my $in_fence = 0;
+    my $fence_char = "";
+    my $fence_len = 0;
+    my $i = 0;
+
+    sub has_box_drawing {
+      return $_[0] =~ /[\x{2500}-\x{257F}]/;
+    }
+
+    sub is_box_table_line {
+      return $_[0] =~ /[\x{2502}\x{250C}\x{2510}\x{2514}\x{2518}\x{251C}\x{2524}\x{252C}\x{2534}\x{253C}]/;
+    }
+
+    sub is_decorative_rule {
+      my ($line) = @_;
+      my $copy = $line;
+      $copy =~ s/\r?\n$//;
+      $copy =~ s/^[ \t]+|[ \t]+$//g;
+      return $copy =~ /[\x{2500}-\x{257F}]/ && $copy !~ /[\x{2502}\x{250C}\x{2510}\x{2514}\x{2518}\x{251C}\x{2524}\x{252C}\x{2534}\x{253C}]/;
+    }
+
+    sub normalize_decorative_rule {
+      my ($line) = @_;
+      $line =~ s/\r?\n$//;
+      $line =~ s/^[ \t]+|[ \t]+$//g;
+      return "\n$line\n\n";
+    }
+
+    sub starts_fence {
+      my ($line) = @_;
+      return $line =~ /^[ \t]*(`{3,}|~{3,})/;
+    }
+
+    sub trim {
+      my ($value) = @_;
+      $value //= "";
+      $value =~ s/\r?\n$//;
+      $value =~ s/^[ \t]+|[ \t]+$//g;
+      return $value;
+    }
+
+    sub markdown_cell {
+      my ($value) = @_;
+      $value = trim($value);
+      $value =~ s/\|/\\|/g;
+      return length($value) ? $value : " ";
+    }
+
+    sub parse_box_row {
+      my ($line) = @_;
+      $line =~ s/\r?\n$//;
+      return unless $line =~ /\x{2502}/;
+
+      my @parts = split /\x{2502}/, $line, -1;
+      shift @parts if @parts && $parts[0] !~ /\S/;
+      pop @parts if @parts && $parts[-1] !~ /\S/;
+      return @parts;
+    }
+
+    sub combine_box_group {
+      my ($rows, $cols) = @_;
+      my @cells;
+
+      for my $col (0 .. $cols - 1) {
+        my @parts;
+        for my $row (@$rows) {
+          my $part = trim($row->[$col] // "");
+          push @parts, markdown_cell($part) if length($part);
+        }
+        $cells[$col] = @parts ? join("<br>", @parts) : " ";
+      }
+
+      return @cells;
+    }
+
+    sub fallback_code_block {
+      my (@block) = @_;
+      return ("```text\n", @block, "```\n");
+    }
+
+    sub convert_box_table {
+      my (@block) = @_;
+      my @groups;
+      my @current;
+      my $cols = 0;
+
+      for my $line (@block) {
+        my @cells = parse_box_row($line);
+        if (@cells) {
+          $cols = @cells if @cells > $cols;
+          push @current, \@cells;
+          next;
+        }
+
+        if (@current) {
+          push @groups, [@current];
+          @current = ();
+        }
+      }
+      push @groups, [@current] if @current;
+
+      return fallback_code_block(@block) if $cols < 2 || !@groups;
+
+      my @header;
+      my @body_groups;
+      if (@groups >= 2) {
+        @header = combine_box_group(shift @groups, $cols);
+        @body_groups = @groups;
+      } else {
+        @header = map { "Column " . ($_ + 1) } 0 .. $cols - 1;
+        @body_groups = @groups;
+      }
+
+      my @out;
+      push @out, "|" . join("|", map { " " . markdown_cell($_) . " " } @header) . "|\n";
+      push @out, "|" . join("|", map { " --- " } @header) . "|\n";
+      for my $group (@body_groups) {
+        my @row = combine_box_group($group, $cols);
+        push @out, "|" . join("|", map { " " . markdown_cell($_) . " " } @row) . "|\n";
+      }
+
+      return @out;
+    }
+
+    while ($i <= $#lines) {
+      my $line = $lines[$i];
+
+      if (!$in_fence && $line =~ /^([ \t]*)(`{3,}|~{3,})/) {
+        $in_fence = 1;
+        $fence_char = substr($2, 0, 1);
+        $fence_len = length($2);
+        print $line;
+        $i++;
+        next;
+      }
+
+      if ($in_fence) {
+        print $line;
+        if ($line =~ /^[ \t]*(?:\Q$fence_char\E){$fence_len,}[ \t]*$/) {
+          $in_fence = 0;
+        }
+        $i++;
+        next;
+      }
+
+      if (has_box_drawing($line)) {
+        if (is_decorative_rule($line)) {
+          print normalize_decorative_rule($line);
+          $i++;
+          next;
+        }
+
+        my @block;
+        my $box_count = 0;
+        while ($i <= $#lines) {
+          my $candidate = $lines[$i];
+          last if starts_fence($candidate);
+          last if $candidate =~ /^[ \t]*$/;
+          last if !is_box_table_line($candidate);
+          push @block, $candidate;
+          $box_count++;
+          $i++;
+        }
+
+        if ($box_count >= 2) {
+          print convert_box_table(@block);
+        } else {
+          print @block;
+        }
+        next;
+      }
+
+      print $line;
+      $i++;
+    }
+  '
+}
+
+preserve_cli_finding_breaks() {
+  perl -Mstrict -Mwarnings -CSDA -e '
+    use utf8;
+
+    my $in_fence = 0;
+    my $fence_char = "";
+    my $fence_len = 0;
+
+    while (my $line = <STDIN>) {
+      if (!$in_fence && $line =~ /^([ \t]*)(`{3,}|~{3,})/) {
+        $in_fence = 1;
+        $fence_char = substr($2, 0, 1);
+        $fence_len = length($2);
+        print $line;
+        next;
+      }
+
+      if ($in_fence) {
+        print $line;
+        if ($line =~ /^[ \t]*(?:\Q$fence_char\E){$fence_len,}[ \t]*$/) {
+          $in_fence = 0;
+        }
+        next;
+      }
+
+      if ($line =~ /^[ \t]*(Finding|정정 위치|핵심 변경):[ \t]*/) {
+        $line =~ s/[ \t\r\n]+$/  \n/;
+      }
+
+      print $line;
+    }
+  '
+}
+
 write_raw_markdown() {
   local content="$1"
   local preview_file="$2"
   local mermaid_compat="$3"
 
   if [[ "$mermaid_compat" == "0" ]]; then
-    printf '%s\n' "$content" > "$preview_file"
+    printf '%s\n' "$content" | transform_terminal_box_tables | preserve_cli_finding_breaks > "$preview_file"
     return
   fi
 
@@ -512,11 +762,48 @@ write_raw_markdown() {
 
       print $line;
     }
-  ' > "$preview_file"
+  ' | transform_terminal_box_tables | preserve_cli_finding_breaks > "$preview_file"
 }
 
 write_prose() {
-  printf '%s\n' "$1" | perl -pe 's/[ \t]+$//; s/&/&amp;/g; s/</&lt;/g; s/>/&gt;/g; s/$/  / if /\S/' > "$2"
+  printf '%s\n' "$1" | transform_terminal_box_tables | preserve_cli_finding_breaks | perl -Mstrict -Mwarnings -e '
+    my $in_fence = 0;
+    my $fence_char = "";
+    my $fence_len = 0;
+
+    while (my $line = <STDIN>) {
+      if (!$in_fence && $line =~ /^([ \t]*)(`{3,}|~{3,})/) {
+        $in_fence = 1;
+        $fence_char = substr($2, 0, 1);
+        $fence_len = length($2);
+        $line =~ s/[ \t]+$//;
+        print $line;
+        next;
+      }
+
+      if ($in_fence) {
+        $line =~ s/[ \t]+$//;
+        print $line;
+        if ($line =~ /^[ \t]*(?:\Q$fence_char\E){$fence_len,}[ \t]*$/) {
+          $in_fence = 0;
+        }
+        next;
+      }
+
+      if ($line =~ /^[ \t]*\|/) {
+        $line =~ s/[ \t]+$//;
+        print $line;
+        next;
+      }
+
+      $line =~ s/[ \t]+$//;
+      $line =~ s/&/&amp;/g;
+      $line =~ s/</&lt;/g;
+      $line =~ s/>/&gt;/g;
+      $line =~ s/$/  / if $line =~ /\S/;
+      print $line;
+    }
+  ' > "$2"
 }
 
 write_links() {
@@ -888,6 +1175,8 @@ write_html_preview() {
       padding: 1rem 1.2rem;
       background: var(--code);
       border: 1px solid var(--line);
+      line-height: 1.55;
+      white-space: pre;
     }
     .content pre code.hljs {
       padding: 0;
@@ -912,8 +1201,14 @@ write_html_preview() {
     .content th, .content td {
       border: 1px solid var(--line);
       padding: 0.55rem 0.7rem;
+      vertical-align: top;
+      line-height: 1.55;
     }
-    .content th { background: #f0e2d2; }
+    .content th {
+      background: #f0e2d2;
+      font-weight: 750;
+      white-space: nowrap;
+    }
     ::selection {
       background: rgba(255, 213, 92, 0.5);
       color: inherit;
@@ -1148,6 +1443,7 @@ main() {
   local history_action=""
   local history_index=""
   local mode="auto"
+  local input_file=""
   local content
 
   while (( $# > 0 )); do
@@ -1177,6 +1473,11 @@ main() {
         shift
         [[ $# -gt 0 ]] || { print -u2 -- "--output requires a value"; return 1; }
         output_file="$1"
+        ;;
+      --file)
+        shift
+        [[ $# -gt 0 ]] || { print -u2 -- "--file requires a value"; return 1; }
+        input_file="$1"
         ;;
       --keep-mermaid-html)
         mermaid_compat=0
@@ -1214,7 +1515,11 @@ main() {
         break
         ;;
       *)
-        mode="$1"
+        if [[ -z "$input_file" && -f "$1" ]]; then
+          input_file="$1"
+        else
+          mode="$1"
+        fi
         ;;
     esac
     shift
@@ -1279,7 +1584,18 @@ main() {
   fi
 
   if [[ "$command" != "history" ]]; then
-    if [[ -t 0 ]]; then
+    if [[ -n "$input_file" ]]; then
+      input_file="$(expand_user_path "$input_file")"
+      if [[ ! -f "$input_file" ]]; then
+        print -u2 -- "파일을 찾을 수 없습니다: $input_file"
+        return 1
+      fi
+      if [[ ! -r "$input_file" ]]; then
+        print -u2 -- "파일을 읽을 수 없습니다: $input_file"
+        return 1
+      fi
+      content="$(cat "$input_file")"
+    elif [[ -t 0 ]]; then
       if ! content="$(read_clipboard)"; then
         print -u2 -- "pbpaste를 찾을 수 없습니다. 파이프 입력을 사용하세요."
         return 1
