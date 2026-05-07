@@ -4,6 +4,37 @@ AI agent CLI로 터미널에서 작업할 때 응답을 더 직관적이고 가�
 
 MVP 버전에서는 CLI 응답을 복사한 뒤 `md-preview` 또는 단축 명령인 `mdp`를 실행하면, 복사된 텍스트를 HTML로 변환하고 웹브라우저에서 스타일이 적용된 형태로 렌더링합니다.
 
+## 설치
+
+`bin/md-preview`와 `bin/mdp`를 PATH 위에 올려두면 어느 디렉터리에서나 명령어로 사용할 수 있습니다. 권장 방식은 사용자 로컬 bin 디렉터리(`~/.local/bin`)에 심볼릭 링크를 거는 것입니다.
+
+```sh
+mkdir -p ~/.local/bin
+ln -sf "$PWD/bin/md-preview" ~/.local/bin/md-preview
+ln -sf "$PWD/bin/mdp"        ~/.local/bin/mdp
+```
+
+`~/.local/bin`이 PATH에 없다면 셸 설정 파일(`~/.zshrc` 또는 `~/.bashrc`)에 다음을 추가하고 셸을 새로 엽니다.
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+설치 확인:
+
+```sh
+which mdp
+mdp --help
+```
+
+`bin/mdp`는 zsh의 `${0:A:h}` 확장으로 자기 자신의 실제 경로를 따라가 옆에 있는 `md-preview`를 실행하는 wrapper입니다. 따라서 두 파일은 항상 같은 디렉터리에 함께 두어야 하며, 심볼릭 링크는 어디에 만들어도 동작합니다.
+
+대안으로 PATH에 프로젝트의 `bin/` 디렉터리를 직접 추가해도 됩니다.
+
+```sh
+export PATH="$HOME/workspaces/my/md-preview/bin:$PATH"
+```
+
 ## 사용법
 
 ```sh
